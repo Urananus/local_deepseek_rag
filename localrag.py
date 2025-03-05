@@ -1,132 +1,131 @@
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain.chains import RetrievalQA
-from langchain.schema import Document
-import gradio as gr
 import asyncio
-from pypdf import PdfReader
-from langchain_ollama import OllamaEmbeddings, OllamaLLM
+from pathlib import Path
+import os 
+from typing import List
+from pydantic import BaseModel, Field, ValidationError, model_validator
+from langchain_community.document_loaders import DirectoryLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_ollama import OllamaEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+import ollama
 
-async def async_initialize_rag(pdf_files):
-    try:
-        # Process PDF files and create documents
-        documents = []
-        for pdf_file in pdf_files:
-            with open(pdf_file.name, "rb") as f:
-                pdf = PdfReader(f)
-                documents.extend([
-                    Document(
-                        page_content=page.extract_text(),
-                        metadata={"source": pdf_file.name, "page": i+1}
-                    )
-                    for i, page in enumerate(pdf.pages)
-                    if page.extract_text().strip()  # Skip empty pages
-                ])
+class RAGConfig(BaseModel):
+    """Optimized CPU configuration with model validation"""
+    data_dir: Path = Field(..., description="Path to document directory")
+    chunk_size: int = Field(512, ge=256, le=1024, description="Optimal CPU chunk size")
+    chunk_overlap: int = Field(128, ge=0, description="Context overlap")
+    embeddings_model: str = Field(
+        default="nomic-embed-text",
+        description="Ollama model name",
+        env="RAG_MODEL"  # Add environment variable binding
+    )
+    search_k: int = Field(3, description="Retrieval count")
+    ollama_timeout: int = Field(60, description="Embedding request timeout")
 
-        # Split documents into chunks
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len
-        )
-        chunks = text_splitter.split_documents(documents)
-
-        # Create embeddings and vector store
-        embeddings = OllamaEmbeddings(
-            model="deepseek-r1"
-        
-        )
-        
-        vector_store = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            persist_directory="./chroma_db"
-        )
-
-        # Create QA pipeline
-        llm = OllamaLLM(
-            model="deepseek-r1",
-            temperature=0.3,
-            num_ctx=4096
-        )
-        
-        return RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",
-            retriever=vector_store.as_retriever(search_kwargs={"k": 4}),
-            return_source_documents=True
-        )
-    except Exception as e:
-        raise RuntimeError(f"Initialization failed: {str(e)}")
-
-async def async_ask_question(query, pipeline):
-    try:
-        response = await asyncio.to_thread(pipeline.invoke, {"query": query})
-        answer = response["result"]
-        sources = "\n".join(
-            f"• {doc.metadata['source']} (page {doc.metadata.get('page', 'N/A')})"
-            for doc in response["source_documents"]
-        )
-        return f"{answer}\n\nSources:\n{sources}"
-    except Exception as e:
-        return f"Error processing query: {str(e)}"
-
-def create_interface():
-    with gr.Blocks(title="Advanced RAG System") as interface:
-        gr.Markdown("# PDF Knowledge Assistant\nUpload PDFs and ask questions")
-        
-        with gr.Row():
-            with gr.Column():
-                file_upload = gr.File(
-                    file_count="multiple",
-                    label="Upload PDF Documents",
-                    type="filepath"
-                )
-                init_btn = gr.Button("Initialize System", variant="primary")
-                status = gr.Textbox(label="System Status", interactive=False)
+    @model_validator(mode='after')
+    def validate_ollama(self):
+        """Verify Ollama service and model availability"""
+        try:
+            # Check connection by listing models
+            model_list = ollama.list()
+            models = model_list.get('models', [])
             
-            with gr.Column():
-                question_input = gr.Textbox(
-                    label="Your Question",
-                    placeholder="Ask anything about the documents...",
-                    lines=3
+            if not models:
+                raise ValueError("No Ollama models installed. Install first with:\nollama pull nomic-embed-text")
+
+            # Check for model name with version tag handling
+            model_exists = any(
+                self.embeddings_model in m.model
+                for m in models
+            )
+            
+            if not model_exists:
+                available_models = "\n".join([f"- {m.model}" for m in models])
+                raise ValueError(
+                    f"Model '{self.embeddings_model}' not found.\n"
+                    f"Installed models:\n{available_models}\n"
+                    f"Install with: ollama pull {self.embeddings_model}"
                 )
-                ask_btn = gr.Button("Ask Question", variant="secondary")
-                response_output = gr.Textbox(
-                    label="Answer",
-                    interactive=False,
-                    lines=6
-                )
+                
+        except Exception as e:
+            raise ValueError(
+                f"Ollama connection failed: {str(e)}\n"
+                "First troubleshooting steps:\n"
+                "1. Start Ollama service: ollama serve\n"
+                "2. Verify installation: ollama list"
+            ) from e
         
-        # State management
-        pipeline_state = gr.State()
+        return self
 
-        # Event handlers
-        init_btn.click(
-            fn=async_initialize_rag,
-            inputs=file_upload,
-            outputs=pipeline_state,
-            api_name="init_rag"
-        ).then(
-            lambda: "System Ready - You can now ask questions",
-            outputs=status
+async def load_documents(config: RAGConfig) -> List[Document]:
+    """Async document loading with parallel processing"""
+    loader = DirectoryLoader(
+        str(config.data_dir),
+        show_progress=True,
+        use_multithreading=True,
+        silent_errors=True
+    )
+    
+    splitter = RecursiveCharacterTextSplitter(
+    chunk_size=config.chunk_size,
+    chunk_overlap=config.chunk_overlap,
+    separators=["\n\n", "\n", ". ", "! ", "? ", " ", ""]
+)
+    
+    return await splitter.atransform_documents(await loader.aload())
+
+async def create_retriever(config: RAGConfig) -> FAISS.as_retriever:
+    """Create optimized retriever with error handling"""
+    try:
+        embeddings = OllamaEmbeddings(
+            model=config.embeddings_model,
+            base_url="http://localhost:11434"
         )
-
-        ask_btn.click(
-            fn=async_ask_question,
-            inputs=[question_input, pipeline_state],
-            outputs=response_output,
-            api_name="ask_question"
-        )
-
-    return interface
+        
+        documents = await load_documents(config)
+        return FAISS.from_documents(
+            documents=documents,
+            embedding=embeddings
+        ).as_retriever(search_kwargs={"k": config.search_k})
+    
+    except Exception as e:
+        raise RuntimeError(f"Retriever creation failed: {str(e)}")
 
 if __name__ == "__main__":
-    # Create and launch interface
-    interface = create_interface()
-    interface.launch(
-        server_port=7860,
-        share=False,
-        show_error=True,
-        favicon_path=None
-    )
+    try:
+        # Remove hardcoded model name to use environment variable
+        config = RAGConfig(
+            data_dir=Path("/home/jesus/local_deepseek_rag/myDocuments"),
+            chunk_size=512,
+            chunk_overlap=128,
+            search_k=3,
+            ollama_timeout=60
+        )
+        retriever = asyncio.run(create_retriever(config))
+        
+        print("🦙 CPU-Optimized RAG System Ready")
+        while True:
+            try:
+                query = input("\n🔍 Query: ").strip()
+                if not query:
+                    continue
+                if query.lower() in ("exit", "quit"):
+                    break
+                
+                results = retriever.get_relevant_documents(query)
+                print(f"\n📚 Retrieved {len(results)} results:")
+                for i, doc in enumerate(results, 1):
+                    source = Path(doc.metadata['source']).name
+                    print(f"{i}. {source} ({len(doc.page_content)} chars)")
+                    print(f"   {doc.page_content[:296]}...\n")
+                    print("🦙")
+                    
+            except KeyboardInterrupt:
+                print("\n🛑 Operation cancelled")
+                break
+            
+    except ValidationError as e:
+        print(f"❌ Configuration error: {e}")
+    except Exception as e:
+        print(f"🔥 Critical error: {str(e)}")
